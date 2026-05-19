@@ -11,10 +11,10 @@ using UnityEngine.UI;
 public class ArUcoMarkerTracker : MonoBehaviour
 {
     [Header("Camera Access")]
-    [SerializeField] private PassthroughCameraAccess cameraAccess; // Requires MRUK package
+    [SerializeField] private PassthroughCameraAccess cameraAccess; 
 
     [Header("ArUco Settings")]
-    [SerializeField] private float markerSize = 0.1f;
+    [SerializeField] private float markerSize = 0.18f;
     [SerializeField] private int targetMarkerId = 0;
 
     [Header("Tracking Settings")]
@@ -44,6 +44,7 @@ public class ArUcoMarkerTracker : MonoBehaviour
     private Vector3 targetPosition;
     private Quaternion targetRotation;
 
+        private bool cameraMatrixReady = false;
     void Start()
     {
         InitializeOpenCV();
@@ -70,7 +71,7 @@ public class ArUcoMarkerTracker : MonoBehaviour
             new Point3f(-h, -h, 0f)
         };
         // Create Mat header directly over the blittable struct array (OpenCvSharp copies/pins internally)
-        markerObjMat = new Mat(4, 1, MatType.CV_32FC3, objPts);
+        markerObjMat = new Mat(4, 1, MatType.CV_32FC3, objPts).Clone();
     }
 
     void InitializeCameraMatrix()
@@ -90,11 +91,11 @@ public class ArUcoMarkerTracker : MonoBehaviour
             0.0,                      intrinsics.FocalLength.y, intrinsics.PrincipalPoint.y,
             0.0,                      0.0,                      1.0
         };
-        cameraMatrix = new Mat(3, 3, MatType.CV_64FC1, camData);
+        cameraMatrix = new Mat(3, 3, MatType.CV_64FC1, camData).Clone();
 
         // Quest cameras are well-calibrated; distortion is near zero
         double[] distData = new double[] { 0, 0, 0, 0, 0 };
-        distCoeffs = new Mat(1, 5, MatType.CV_64FC1, distData);
+        distCoeffs = new Mat(1, 5, MatType.CV_64FC1, distData).Clone();
 
         if (showDebugLogs)
         {
@@ -116,11 +117,32 @@ public class ArUcoMarkerTracker : MonoBehaviour
             return;
         }
 
+        Texture cameraTexture = cameraAccess.GetTexture();
+        if (cameraTexture == null)
+        {
+            if (showDebugLogs && Time.frameCount % 120 == 0)
+                Debug.LogWarning("[ArUco] GetTexture() returned null");
+            return;
+        }
+        if (showDebugLogs && Time.frameCount % 120 == 0)
+        {
+            Debug.Log($"[ArUco] Texture: {cameraTexture.width}x{cameraTexture.height}, format: {cameraTexture.GetType()}");
+        }
+        if (!cameraMatrixReady)
+        {
+            var intrinsics = cameraAccess.Intrinsics;
+            if (intrinsics.FocalLength.x > 0 && intrinsics.FocalLength.y > 0)
+            {
+                InitializeCameraMatrix();
+                cameraMatrixReady = true;
+            }
+            else return;
+        }
+
         // Camera available → ensure cube is visible
         if (mesh != null && !mesh.enabled)
             mesh.enabled = true;
 
-        Texture cameraTexture = cameraAccess.GetTexture();
         if (cameraTexture == null) return;
 
         ProcessFrame(cameraTexture);
@@ -165,6 +187,7 @@ public class ArUcoMarkerTracker : MonoBehaviour
 
             // --- Grayscale for detection ---
             Cv2.CvtColor(rgbMat, grayMat, ColorConversionCodes.RGB2GRAY);
+            Cv2.Flip(grayMat, grayMat, FlipMode.X);
 
             // --- Detect markers ---
             Point2f[][] corners;
@@ -221,6 +244,7 @@ public class ArUcoMarkerTracker : MonoBehaviour
         using (Mat rgba = new Mat())
         {
             Cv2.CvtColor(mat, rgba, ColorConversionCodes.RGB2RGBA);
+            Cv2.Flip(rgbMat, rgbMat, FlipMode.X);
             Color32[] px = new Color32[rgba.Width * rgba.Height];
             for (int y = 0; y < rgba.Height; y++)
             {
@@ -249,15 +273,15 @@ public class ArUcoMarkerTracker : MonoBehaviour
             // OpenCV:  Right-handed (X right, Y down, Z forward)
             // Unity:   Left-handed  (X right, Y up,   Z forward)
             Matrix4x4 R = Matrix4x4.identity;
-            R.m00 = (float)r[0]; R.m01 = -(float)r[1]; R.m02 = -(float)r[2];
-            R.m10 = -(float)r[3]; R.m11 = (float)r[4]; R.m12 = (float)r[5];
-            R.m20 = -(float)r[6]; R.m21 = (float)r[7]; R.m22 = (float)r[8];
+            R.m00 = (float)r[0]; R.m01 = -(float)r[1]; R.m02 = (float)r[2];
+            R.m10 = -(float)r[3]; R.m11 = (float)r[4]; R.m12 = -(float)r[5];
+            R.m20 = (float)r[6]; R.m21 = -(float)r[7]; R.m22 = (float)r[8];
 
             Quaternion q = Quaternion.LookRotation(R.GetColumn(2), R.GetColumn(1));
 
             double[] t = new double[3];
             tvec.GetArray(0, 0, t);
-            Vector3 pos = new Vector3((float)t[0], -(float)t[1], -(float)t[2]);
+            Vector3 pos = new Vector3((float)t[0], -(float)t[1], (float)t[2]);
 
             // Transform from camera-local to world space
             Pose camPose = cameraAccess.GetCameraPose();
