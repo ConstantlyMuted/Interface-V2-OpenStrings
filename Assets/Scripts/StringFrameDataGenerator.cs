@@ -43,28 +43,28 @@ using UnityEditor;
 public class StringFrameConfig
 {
     // Frequenz & Akustik
-    public float fStart      = 32.7f;
-    public int   nFreq       = 37;
-    public int   nPartials   = 25;
+    public float fStart = 32.7f;
+    public int nFreq = 37;
+    public int nPartials = 25;
 
     // Saiten-Geometrie (Instrument)
-    public float strLenMaxMm    = 1300f;
-    public float strLenMinMm    =  938f;
-    public float stringPerpMm   =   10f;
+    public float strLenMaxMm = 1300f;
+    public float strLenMinMm = 938f;
+    public float stringPerpMm = 10f;
     public float bridgeAngleDeg = 105f;
-    public float rot1Deg        =  22f;     // Kippung nach hinten
-    public float zNutM          = 0.77f;    // Sattel-Höhe
+    public float rot1Deg = 22f;     // Kippung nach hinten
+    public float zNutM = 0.77f;    // Sattel-Höhe
 
     // Helix-Parameter
-    public float helixR0M       = 1.80f;
-    public float helixDrM       = 0.080f;
-    public float helixHOctM     = 0.18f;
-    public float helixZOffsetM  = 0.10f;
-    public float helixAlpha     = 1.07f;
-    public float helixArcDeg    = 360f;
+    public float helixR0M = 1.80f;
+    public float helixDrM = 0.080f;
+    public float helixHOctM = 0.18f;
+    public float helixZOffsetM = 0.10f;
+    public float helixAlpha = 1.07f;
+    public float helixArcDeg = 360f;
 
     // Sampling
-    public int   helixSamples   = 200;
+    public int helixSamples = 200;
 }
 
 
@@ -74,8 +74,8 @@ public class StringFrameConfig
 public static class StringFrameDataGenerator
 {
     public const float ArcCenterRad = -Mathf.PI / 2f;
-    public const float DegToRad     = Mathf.PI / 180f;
-    public const float RadToDeg     = 180f / Mathf.PI;
+    public const float DegToRad = Mathf.PI / 180f;
+    public const float RadToDeg = 180f / Mathf.PI;
 
     // -------------------------------------------------------------------------
     // EINSPRUNGSPUNKT
@@ -84,7 +84,7 @@ public static class StringFrameDataGenerator
     {
         Debug.Log("[StringFrameDataGenerator] Starte Berechnung…");
 
-        var frequencies   = ComputeFrequencies(cfg);
+        var frequencies = ComputeFrequencies(cfg);
         var stringLengths = ComputeStringLengths(cfg);
 
         ComputeTwoRotations(cfg, out float rot2Rad, out float Y36zMm, out float[,] R);
@@ -94,9 +94,9 @@ public static class StringFrameDataGenerator
 
         ComputeAnchorsAndBridge(cfg, stringLengths, R, Y36zMm, out var anchors, out var bridgeEnds);
 
-        var spheres      = ComputeBalls(cfg, frequencies);
-        var helixCurves  = ComputeHelixCurves(cfg, frequencies);
-        var unisonLines  = ComputeUnisonLines(cfg, frequencies);
+        var spheres = ComputeBalls(cfg, frequencies);
+        var helixCurves = ComputeHelixCurves(cfg, frequencies);
+        var unisonLines = ComputeUnisonLines(cfg, frequencies);
 
         Debug.Log(string.Format(CultureInfo.InvariantCulture,
             "[StringFrameDataGenerator] {0} Unisono-Gruppen ({1} Bälle)",
@@ -161,7 +161,9 @@ public static class StringFrameDataGenerator
         float Ldiff = (cfg.strLenMaxMm - cfg.strLenMinMm) / 1000f;
         float cosBridge = Mathf.Cos(cfg.bridgeAngleDeg * DegToRad);
         float cos2 = cosBridge * cosBridge;
-        float Y36z = Ldiff - Wperp * Mathf.Sqrt(cos2 / (1 - cos2));
+        // Y36_z = L_diff + W · sqrt(cos²/(1−cos²))  damit der STUMPFE Winkel (105°)
+        // an der LÄNGSTEN Saite (Saite[0]) liegt (innerer Trapez-Winkel).
+        float Y36z = Ldiff + Wperp * Mathf.Sqrt(cos2 / (1 - cos2));
         Y36zMm = Y36z * 1000f;
 
         float rot1Rad = cfg.rot1Deg * DegToRad;
@@ -211,7 +213,7 @@ public static class StringFrameDataGenerator
                                          out Vector3[] anchors, out Vector3[] bridgeEnds)
     {
         int N = cfg.nFreq;
-        anchors    = new Vector3[N];
+        anchors = new Vector3[N];
         bridgeEnds = new Vector3[N];
 
         float spacingX = cfg.stringPerpMm / 1000f;
@@ -224,13 +226,14 @@ public static class StringFrameDataGenerator
 
         for (int i = 0; i < N; i++)
         {
-            Vector3 nutPre    = new Vector3(i * spacingX, 0, i * spacingZ);
+            Vector3 nutPre = new Vector3(i * spacingX, 0, i * spacingZ);
             Vector3 bridgePre = new Vector3(nutPre.x, nutPre.y, nutPre.z + stringLengths[i]);
-            Vector3 nut3d    = MatVec(R, nutPre);
+            Vector3 nut3d = MatVec(R, nutPre);
             Vector3 bridge3d = MatVec(R, bridgePre);
             // Daten-Konvention: x=horizontal, y=Tiefe, z=Höhe
-            anchors[i]    = new Vector3(nut3d.x - xOffset,    nut3d.y,    nut3d.z + cfg.zNutM);
-            bridgeEnds[i] = new Vector3(bridge3d.x - xOffset, bridge3d.y, bridge3d.z + cfg.zNutM);
+            // x-Komponente gespiegelt, damit Saite[0] (lang) vom Spieler aus rechts ist
+            anchors[i] = new Vector3(nut3d.x-xOffset, nut3d.y, nut3d.z + cfg.zNutM);
+            bridgeEnds[i] = new Vector3(bridge3d.x-xOffset, bridge3d.y, bridge3d.z + cfg.zNutM);
         }
     }
 
@@ -265,8 +268,9 @@ public static class StringFrameDataGenerator
                 float u = Mathf.Log(f / cfg.fStart, 2f);
                 float theta = HelixAngle(cfg, u);
                 float r = cfg.helixR0M + i * cfg.helixDrM;
-                row[k - 1] = new Sphere {
-                    x = r * Mathf.Cos(theta),
+                row[k - 1] = new Sphere
+                {
+                    x = -r * Mathf.Cos(theta),   // x-Spiegelung (Saite[0] rechts)
                     y = r * Mathf.Sin(theta),
                     z = cfg.zNutM + cfg.helixZOffsetM + cfg.helixHOctM * u,
                     k = k,
@@ -293,7 +297,7 @@ public static class StringFrameDataGenerator
                 float theta = HelixAngle(cfg, u);
                 float r = cfg.helixR0M + i * cfg.helixDrM;
                 pts[j] = new Vector3(
-                    r * Mathf.Cos(theta),
+                    -r * Mathf.Cos(theta),    // x-Spiegelung (Saite[0] rechts)
                     r * Mathf.Sin(theta),
                     cfg.zNutM + cfg.helixZOffsetM + cfg.helixHOctM * u
                 );
@@ -338,7 +342,8 @@ public static class StringFrameDataGenerator
             if (kvp.Value.Count < 2) continue;
             kvp.Value.Sort((a, b) => a[0].CompareTo(b[0]));
             float f = cfg.fStart * kvp.Key / 16f;
-            lines.Add(new UnisonLine {
+            lines.Add(new UnisonLine
+            {
                 M = kvp.Key,
                 frequency = f,
                 cents = 1200f * Mathf.Log(f / cfg.fStart, 2f),
@@ -408,13 +413,29 @@ public static class StringFrameDataGenerator
         Debug.Log(string.Format(CultureInfo.InvariantCulture,
             "[Verifikation] Sattel-z: {0:F5} … {1:F5}m  (sollte konstant sein)", zMin, zMax));
 
-        // Bridge-Winkel zur längsten Saite
-        Vector3 s0 = (bridgeEnds[0] - anchors[0]).normalized;
+        // INNERER Trapez-Winkel an Saite[0]-Steg (Sollwert 105°)
+        // gemessen zwischen "Saite zurück zum Sattel" und "Steg in Richtung Saite[36]"
+        Vector3 s0Back = (anchors[0] - bridgeEnds[0]).normalized;
         Vector3 br = (bridgeEnds[cfg.nFreq - 1] - bridgeEnds[0]).normalized;
-        float cosA = Mathf.Clamp(Vector3.Dot(s0, br), -1f, 1f);
+        float cosA = Mathf.Clamp(Vector3.Dot(s0Back, br), -1f, 1f);
+        float angleLongest = Mathf.Acos(cosA) * RadToDeg;
         Debug.Log(string.Format(CultureInfo.InvariantCulture,
-            "[Verifikation] Bridge-Winkel zur längsten Saite: {0:F2}° (sollte {1}°)",
-            Mathf.Acos(cosA) * RadToDeg, cfg.bridgeAngleDeg));
+            "[Verifikation] Bridge-Winkel an Saite[0]  (längste, INNEN):  {0:F2}° (sollte 105°)",
+            angleLongest));
+
+        // INNERER Trapez-Winkel an Saite[N-1]-Steg (Sollwert 75°)
+        int last = cfg.nFreq - 1;
+        Vector3 s36Back = (anchors[last] - bridgeEnds[last]).normalized;
+        Vector3 br36 = (bridgeEnds[0] - bridgeEnds[last]).normalized;
+        float cosB = Mathf.Clamp(Vector3.Dot(s36Back, br36), -1f, 1f);
+        float angleShortest = Mathf.Acos(cosB) * RadToDeg;
+        Debug.Log(string.Format(CultureInfo.InvariantCulture,
+            "[Verifikation] Bridge-Winkel an Saite[{0}] (kürzeste, INNEN): {1:F2}° (sollte 75°)",
+            last, angleShortest));
+
+        Debug.Log(string.Format(CultureInfo.InvariantCulture,
+            "[Verifikation] Summe der beiden Winkel:                       {0:F2}° (sollte 180°)",
+            angleLongest + angleShortest));
     }
 
     // -------------------------------------------------------------------------
@@ -433,26 +454,26 @@ public static class StringFrameDataGenerator
 
         // META
         sb.Append(" \"meta\": {\n");
-        AppendKVStr(sb, "version",        "V18-csharpGenerator", false);
+        AppendKVStr(sb, "version", "V18-csharpGenerator", false);
         AppendKVStr(sb, "description",
             "37 Saiten × 25 Teiltöne, sinusoidale Helix-Reflexion bei reduziertem Bogen", false);
-        AppendKVInt(sb, "n_freq",          cfg.nFreq, false);
-        AppendKVInt(sb, "n_partials",      cfg.nPartials, false);
-        AppendKVFlt(sb, ci, "f_start",     cfg.fStart, false);
-        AppendKVFlt(sb, ci, "string_length_max_mm",     cfg.strLenMaxMm, false);
-        AppendKVFlt(sb, ci, "string_length_min_mm",     cfg.strLenMinMm, false);
-        AppendKVFlt(sb, ci, "string_perp_distance_mm",  cfg.stringPerpMm, false);
-        AppendKVFlt(sb, ci, "bridge_angle_deg",         cfg.bridgeAngleDeg, false);
-        AppendKVFlt(sb, ci, "rot1_deg",                 cfg.rot1Deg, false);
-        AppendKVFlt(sb, ci, "rot2_deg",                 rot2Rad * RadToDeg, false);
-        AppendKVFlt(sb, ci, "z_nut",                    cfg.zNutM, false);
-        AppendKVFlt(sb, ci, "helix_R0",                 cfg.helixR0M, false);
-        AppendKVFlt(sb, ci, "helix_DR",                 cfg.helixDrM, false);
-        AppendKVFlt(sb, ci, "helix_H_OCT",              cfg.helixHOctM, false);
-        AppendKVFlt(sb, ci, "helix_z_offset",           cfg.helixZOffsetM, false);
-        AppendKVFlt(sb, ci, "helix_alpha",              cfg.helixAlpha, false);
-        AppendKVFlt(sb, ci, "helix_arc_deg",            cfg.helixArcDeg, false);
-        AppendKVFlt(sb, ci, "helix_arc_center_rad",     ArcCenterRad, true);
+        AppendKVInt(sb, "n_freq", cfg.nFreq, false);
+        AppendKVInt(sb, "n_partials", cfg.nPartials, false);
+        AppendKVFlt(sb, ci, "f_start", cfg.fStart, false);
+        AppendKVFlt(sb, ci, "string_length_max_mm", cfg.strLenMaxMm, false);
+        AppendKVFlt(sb, ci, "string_length_min_mm", cfg.strLenMinMm, false);
+        AppendKVFlt(sb, ci, "string_perp_distance_mm", cfg.stringPerpMm, false);
+        AppendKVFlt(sb, ci, "bridge_angle_deg", cfg.bridgeAngleDeg, false);
+        AppendKVFlt(sb, ci, "rot1_deg", cfg.rot1Deg, false);
+        AppendKVFlt(sb, ci, "rot2_deg", rot2Rad * RadToDeg, false);
+        AppendKVFlt(sb, ci, "z_nut", cfg.zNutM, false);
+        AppendKVFlt(sb, ci, "helix_R0", cfg.helixR0M, false);
+        AppendKVFlt(sb, ci, "helix_DR", cfg.helixDrM, false);
+        AppendKVFlt(sb, ci, "helix_H_OCT", cfg.helixHOctM, false);
+        AppendKVFlt(sb, ci, "helix_z_offset", cfg.helixZOffsetM, false);
+        AppendKVFlt(sb, ci, "helix_alpha", cfg.helixAlpha, false);
+        AppendKVFlt(sb, ci, "helix_arc_deg", cfg.helixArcDeg, false);
+        AppendKVFlt(sb, ci, "helix_arc_center_rad", ArcCenterRad, true);
         sb.Append(" },\n");
 
         // FREQUENCIES
@@ -510,11 +531,11 @@ public static class StringFrameDataGenerator
             {
                 var s = spheres[i][k];
                 sb.Append("   {");
-                sb.Append("\"x\": ");      sb.Append(s.x.ToString("R", ci));
-                sb.Append(", \"y\": ");    sb.Append(s.y.ToString("R", ci));
-                sb.Append(", \"z\": ");    sb.Append(s.z.ToString("R", ci));
-                sb.Append(", \"k\": ");    sb.Append(s.k);
-                sb.Append(", \"f\": ");    sb.Append(s.f.ToString("R", ci));
+                sb.Append("\"x\": "); sb.Append(s.x.ToString("R", ci));
+                sb.Append(", \"y\": "); sb.Append(s.y.ToString("R", ci));
+                sb.Append(", \"z\": "); sb.Append(s.z.ToString("R", ci));
+                sb.Append(", \"k\": "); sb.Append(s.k);
+                sb.Append(", \"f\": "); sb.Append(s.f.ToString("R", ci));
                 sb.Append(", \"cents\": "); sb.Append(s.cents.ToString("R", ci));
                 sb.Append("}");
                 if (k < spheres[i].Length - 1) sb.Append(",");
@@ -534,9 +555,9 @@ public static class StringFrameDataGenerator
             for (int j = 0; j < helixCurves[i].Length; j++)
             {
                 var p = helixCurves[i][j];
-                sb.Append("   {\"x\": ");   sb.Append(p.x.ToString("R", ci));
-                sb.Append(", \"y\": ");     sb.Append(p.y.ToString("R", ci));
-                sb.Append(", \"z\": ");     sb.Append(p.z.ToString("R", ci));
+                sb.Append("   {\"x\": "); sb.Append(p.x.ToString("R", ci));
+                sb.Append(", \"y\": "); sb.Append(p.y.ToString("R", ci));
+                sb.Append(", \"z\": "); sb.Append(p.z.ToString("R", ci));
                 sb.Append("}");
                 if (j < helixCurves[i].Length - 1) sb.Append(",");
                 sb.Append("\n");
@@ -553,10 +574,10 @@ public static class StringFrameDataGenerator
         {
             var L = unisonLines[u];
             sb.Append("  {");
-            sb.Append("\"M\": ");           sb.Append(L.M);
+            sb.Append("\"M\": "); sb.Append(L.M);
             sb.Append(", \"frequency\": "); sb.Append(L.frequency.ToString("R", ci));
-            sb.Append(", \"cents\": ");     sb.Append(L.cents.ToString("R", ci));
-            sb.Append(", \"count\": ");     sb.Append(L.count);
+            sb.Append(", \"cents\": "); sb.Append(L.cents.ToString("R", ci));
+            sb.Append(", \"count\": "); sb.Append(L.count);
             sb.Append(", \"members\": [");
             for (int m = 0; m < L.members.Length; m++)
             {
@@ -607,11 +628,11 @@ public static class StringFrameDataGenerator
         {
             switch (c)
             {
-                case '"':  sb.Append("\\\""); break;
+                case '"': sb.Append("\\\""); break;
                 case '\\': sb.Append("\\\\"); break;
-                case '\n': sb.Append("\\n");  break;
-                case '\r': sb.Append("\\r");  break;
-                case '\t': sb.Append("\\t");  break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
                 default:
                     if (c < ' ') sb.AppendFormat(CultureInfo.InvariantCulture, "\\u{0:x4}", (int)c);
                     else sb.Append(c);
