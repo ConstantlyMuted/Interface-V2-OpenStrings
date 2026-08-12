@@ -97,10 +97,21 @@ public class StringFrame3D : MonoBehaviour
 
     private const int MaxInstancesPerDrawCall = 1023;
     private Matrix4x4[] _sphereDrawBuffer;
+    private Vector4[] _sphereColorDrawBuffer;
+    private MaterialPropertyBlock _instanceColorBlock;
+
+    // colorBytesAllPartials from DynamicReferenceTone/RangeByteEncoder (Java): flat array,
+    // one byte per sphere, range 0..127 (RangeByteEncoder maxCode=127, LINEAR curve).
+    // Index layout MUST match Java's i * QUANTAE_FORMANTES_C2 + j, i.e. this side's
+    // stringID * config.nPartials + partialIndex — config.nFreq/nPartials must equal
+    // QUANTAE_CHORDAE/QUANTAE_FORMANTES_C2 for the indices to line up.
+    [Header("Harmonicity Color (colorBytesAllPartials)")]
+    public bool useHarmonicityColor = true;
+    [Range(0f, 1f)] public float harmonicityColorBlend = 0.85f;
 
     private readonly List<Matrix4x4> _normalBatch = new List<Matrix4x4>();
-    private readonly List<Matrix4x4> _occupiedBatch = new List<Matrix4x4>();
     private readonly List<Matrix4x4> _highlightBatch = new List<Matrix4x4>();
+    private readonly List<Vector4> _normalColorBatch = new List<Vector4>();
 
     // === LINIEN-REFERENZEN (Anchor kept as individual LineRenderers — already cheap, only 2) ===
     private LineRenderer sattelLine, stegLine;
@@ -350,6 +361,7 @@ public class StringFrame3D : MonoBehaviour
         _stringColors = new Color[config.nFreq];
 
         _sphereDrawBuffer = new Matrix4x4[Mathf.Min(totalSpheres, MaxInstancesPerDrawCall)];
+        _sphereColorDrawBuffer = new Vector4[_sphereDrawBuffer.Length];
 
         sphereScale = Vector3.one * ballRadius * 2f;
     }
@@ -409,7 +421,52 @@ public class StringFrame3D : MonoBehaviour
         return (occupiedSpheresFlags[id >> 5] & (1u << (id & 31))) != 0;
     }
 
+    /// <summary>
+    /// Called when THIS device physically snapped its own local pin onto an empty sphere
+    /// (via SnapGrabbable.TrySnap()). Applies local bookkeeping AND notifies the network —
+    /// this is the "I did this" path. For mirroring another device's snap, use
+    /// MirrorRemoteSnap() instead, which skips the notification (avoids re-announcing an
+    /// action that didn't originate here) and the resonance-selection side effect.
+    /// </summary>
     public void RegisterSnap(int id, SnapGrabbable obj)
+    {
+        ApplyLocalSnap(id, obj);
+
+        if (obj != null)
+        {
+            GetSphereID(id, out int stringID, out int partialIndex);
+            NotifySphereSelected(obj.botIndex, stringID, partialIndex);
+            NotifyPinStateChanged(
+                obj.botIndex,
+                UdpSubscriptionClient.PinStatus.Set,
+                stringID,
+                partialIndex,
+                Vector3.zero,       // ignored by receivers when stringID/partialIndex are valid
+                Quaternion.identity
+            );
+        }
+    }
+
+    /// <summary>
+    /// Mirrors a Set state that arrived over the network (PIN_UPDATE) for a pin THIS device
+    /// didn't itself snap. Applies the same occupied-flag/snappedObjects/color bookkeeping as
+    /// RegisterSnap so every device's rendering (and TrySnap collision-avoidance) agrees on
+    /// which spheres are taken — without re-announcing the selection or re-notifying the
+    /// server, since we're relaying an already-known fact, not originating it.
+    /// </summary>
+    public void MirrorRemoteSnap(int stringID, int partialIndex, SnapGrabbable obj)
+    {
+        if (obj == null) return;
+
+        int id = stringID * config.nPartials + partialIndex;
+        ValidateSphereId(id);
+
+        if (snappedObjects[id] == obj) return; // already applied (e.g. echoed back to the originating device)
+
+        ApplyLocalSnap(id, obj);
+    }
+
+    private void ApplyLocalSnap(int id, SnapGrabbable obj)
     {
         ValidateSphereId(id);
         occupiedSpheresFlags[id >> 5] |= (1u << (id & 31));
@@ -443,25 +500,67 @@ public class StringFrame3D : MonoBehaviour
         col.radius = ballRadius * 0.45f;
         col.isTrigger = true;
 
-        NotifySphereSelected(obj.botIndex, stringID, partialIndex);
+        // NOTE: resonance-selection notification lives in RegisterSnap(), not here — this
+        // method also runs for MirrorRemoteSnap(), which must NOT re-announce a selection
+        // that already happened on the originating device.
     }
 
+    /// <summary>
+    /// Called when THIS device's own local pin is picked back up after being snapped.
+    /// Applies local bookkeeping AND notifies the network. For mirroring another device's
+    /// release, use MirrorRemoteRelease() instead.
+    /// </summary>
     public void ReleaseSnap(int id)
+    {
+        SnapGrabbable obj = ApplyLocalRelease(id);
+
+        if (obj != null)
+        {
+            // Pin picked back up after being set -> report Unset so all devices stay in sync.
+            // No sphere anymore, so fall back to a frame-local pose instead of a raw world one
+            // (every device tracks its own copy of this frame via marker tracking, so a world
+            // coordinate from THIS device would be meaningless on another).
+            Vector3 localPos = transform.InverseTransformPoint(obj.transform.position);
+            Quaternion localRot = Quaternion.Inverse(transform.rotation) * obj.transform.rotation;
+            NotifyPinStateChanged(
+                obj.botIndex,
+                UdpSubscriptionClient.PinStatus.Unset,
+                -1, -1,
+                localPos,
+                localRot
+            );
+        }
+    }
+
+    /// <summary>
+    /// Mirrors another device's release of a sphere this device also has marked occupied
+    /// (via MirrorRemoteSnap). No network notification — we're relaying, not originating.
+    /// </summary>
+    public void MirrorRemoteRelease(int stringID, int partialIndex)
+    {
+        int id = stringID * config.nPartials + partialIndex;
+        ValidateSphereId(id);
+        ApplyLocalRelease(id);
+    }
+
+    private SnapGrabbable ApplyLocalRelease(int id)
     {
         ValidateSphereId(id);
         occupiedSpheresFlags[id >> 5] &= ~(1u << (id & 31));
 
-        if (snappedObjects[id] != null)
+        SnapGrabbable obj = snappedObjects[id];
+        if (obj != null)
         {
-            var relay = snappedObjects[id].GetComponent<SphereTriggerRelay>();
+            var relay = obj.GetComponent<SphereTriggerRelay>();
             if (relay != null) Destroy(relay);
 
-            var triggers = snappedObjects[id].GetComponents<SphereCollider>();
+            var triggers = obj.GetComponents<SphereCollider>();
             foreach (var c in triggers)
                 if (c.isTrigger) Destroy(c);
 
             snappedObjects[id] = null;
         }
+        return obj;
     }
 
     [System.Diagnostics.Conditional("UNITY_EDITOR")]
@@ -532,13 +631,22 @@ public class StringFrame3D : MonoBehaviour
             }
         }
 
+        // Snapshot once per frame — the array reference is swapped wholesale by
+        // UdpSubscriptionClient.ParsePinUpdate/ParseColorUpdate, never mutated in place,
+        // so it's safe to read without locking here.
+        byte[] colorBytes = (useHarmonicityColor && subscribeManager != null)
+            ? subscribeManager.LatestColorBytes
+            : null;
+
         for (int i = 0; i < config.nFreq; i++)
         {
             _normalBatch.Clear();
-            _occupiedBatch.Clear();
             _highlightBatch.Clear();
+            _normalColorBatch.Clear();
 
             Color stringColor = _stringColors[i];
+            Color normalBase = stringColor;
+            normalBase.a = 0.6f;
 
             for (int k = 0; k < config.nPartials; k++)
             {
@@ -550,19 +658,30 @@ public class StringFrame3D : MonoBehaviour
                         continue;
                 }
 
-                if (IsSphereHighlighted(flatIndex))
-                    _highlightBatch.Add(sphereMatrices[flatIndex]);
-                else if (IsSphereOccupied(flatIndex))
-                    _occupiedBatch.Add(sphereMatrices[flatIndex]);
-                else
-                    _normalBatch.Add(sphereMatrices[flatIndex]);
-            }
+                // Occupied slots are already fully represented by the snapped SnapGrabbable's
+                // own render (see UpdateSnappedColor/UpdateSnappedObjects) — drawing an
+                // instanced sphere underneath it too used to double-render two different
+                // colors/alphas on top of each other, which is why pin vs. sphere color never
+                // quite matched.
+                if (IsSphereOccupied(flatIndex))
+                {
+                    continue;
+                }
 
-            stringColor.a = 0.6f;
+                if (IsSphereHighlighted(flatIndex))
+                {
+                    _highlightBatch.Add(sphereMatrices[flatIndex]);
+                }
+                else
+                {
+                    _normalBatch.Add(sphereMatrices[flatIndex]);
+                    _normalColorBatch.Add(GetHarmonicityTintedColor(flatIndex, normalBase, colorBytes));
+                }
+            }
 
             if (_normalBatch.Count > 0)
             {
-                var normalMat = GetCachedMaterial(stringColor, sphereMaterial);
+                var normalMat = GetCachedMaterial(normalBase, sphereMaterial);
                 var normalRp = new RenderParams(normalMat)
                 {
                     layer = gameObject.layer,
@@ -570,26 +689,13 @@ public class StringFrame3D : MonoBehaviour
                     receiveShadows = sphereReceiveShadows,
                     worldBounds = new Bounds(trackedContentRoot.position, Vector3.one * 20f)
                 };
-                RenderMatrixBatch(normalRp, _normalBatch);
-            }
-
-            stringColor.a = 1f;
-
-            if (_occupiedBatch.Count > 0)
-            {
-                var occupiedMat = GetCachedMaterial(stringColor, sphereMaterial);
-                var occupiedRp = new RenderParams(occupiedMat)
-                {
-                    layer = gameObject.layer,
-                    shadowCastingMode = sphereShadowCasting,
-                    receiveShadows = sphereReceiveShadows,
-                    worldBounds = new Bounds(trackedContentRoot.position, Vector3.one * 20f)
-                };
-                RenderMatrixBatch(occupiedRp, _occupiedBatch);
+                RenderMatrixBatch(normalRp, _normalBatch, _normalColorBatch);
             }
 
             if (_highlightBatch.Count > 0)
             {
+                // Highlight stays plain white regardless of harmonicity — it's a UI cue
+                // (nearest-snap-target), blending it in would make it harder to spot.
                 var highlightMat = GetCachedMaterial(Color.white, sphereMaterial);
                 var highlightRp = new RenderParams(highlightMat)
                 {
@@ -598,14 +704,40 @@ public class StringFrame3D : MonoBehaviour
                     receiveShadows = sphereReceiveShadows,
                     worldBounds = new Bounds(trackedContentRoot.position, Vector3.one * 20f)
                 };
-                RenderMatrixBatch(highlightRp, _highlightBatch);
+                RenderMatrixBatch(highlightRp, _highlightBatch, null);
             }
         }
     }
 
-    void RenderMatrixBatch(RenderParams rp, List<Matrix4x4> matrices)
+    /// <summary>
+    /// Blends baseColor with the viridis-mapped harmonicity value for this sphere, if any
+    /// network color data is present for it. colorBytes[flatIndex] is 0..127
+    /// (RangeByteEncoder maxCode=127, LINEAR curve) — see DynamicReferenceTone.getColorBytesAllPartials()
+    /// on the Java side. Falls back to baseColor untouched when data isn't available yet.
+    /// </summary>
+    Color GetHarmonicityTintedColor(int flatIndex, Color baseColor, byte[] colorBytes)
+    {
+        if (colorBytes == null || flatIndex >= colorBytes.Length)
+            return baseColor;
+
+        float t = colorBytes[flatIndex] / 127f;
+        Color harmonicityColor = ViridisLookup(t);
+        Color blended = Color.Lerp(baseColor, harmonicityColor, harmonicityColorBlend);
+        blended.a = baseColor.a;
+        return blended;
+    }
+
+    /// <summary>
+    /// Renders a batch of spheres. When colors is non-null (and its count matches matrices),
+    /// each instance's _Color is overridden per-sphere via MaterialPropertyBlock — this needs
+    /// the material to have GPU instancing enabled (GetCachedMaterial sets this) and its shader
+    /// to expose an instanced _Color property, which Unity's Standard/URP Lit shaders do out of
+    /// the box. When colors is null, every instance just uses the material's own flat color.
+    /// </summary>
+    void RenderMatrixBatch(RenderParams rp, List<Matrix4x4> matrices, List<Vector4> colors)
     {
         int count = matrices.Count;
+        bool hasPerInstanceColor = colors != null && colors.Count == count;
         int offset = 0;
 
         while (offset < count)
@@ -613,11 +745,34 @@ public class StringFrame3D : MonoBehaviour
             int batchSize = Mathf.Min(count - offset, MaxInstancesPerDrawCall);
             matrices.CopyTo(offset, _sphereDrawBuffer, 0, batchSize);
 
+            if (hasPerInstanceColor)
+            {
+                colors.CopyTo(offset, _sphereColorDrawBuffer, 0, batchSize);
+
+                if (_instanceColorBlock == null)
+                    _instanceColorBlock = new MaterialPropertyBlock();
+
+                _instanceColorBlock.Clear();
+                // _sphereColorDrawBuffer.Length is always >= batchSize (same sizing as
+                // _sphereDrawBuffer); extra trailing entries beyond batchSize are unused.
+                // Built-in Standard shader reads "_Color"; URP/Lit reads "_BaseColor" instead.
+                // Set both so this works regardless of which shader sphereMaterial uses.
+                _instanceColorBlock.SetVectorArray("_Color", _sphereColorDrawBuffer);
+                _instanceColorBlock.SetVectorArray("_BaseColor", _sphereColorDrawBuffer);
+                rp.matProps = _instanceColorBlock;
+            }
+            else
+            {
+                rp.matProps = null;
+            }
+
             Graphics.RenderMeshInstanced(rp, sphereMesh, 0, _sphereDrawBuffer, batchSize);
 
             offset += batchSize;
         }
     }
+
+
 
     bool IsPointInFrustum(Vector3 worldPoint)
     {
@@ -887,7 +1042,7 @@ public class StringFrame3D : MonoBehaviour
         if (_lineMaterialCache.TryGetValue(color, out var mat) && mat != null)
             return mat;
 
-        mat = new Material(template) { color = color };
+        mat = new Material(template) { color = color, enableInstancing = true };
         _lineMaterialCache[color] = mat;
         return mat;
     }
@@ -1066,6 +1221,10 @@ public class StringFrame3D : MonoBehaviour
     {
         if (snappedObjects == null) return;
 
+        byte[] colorBytes = (useHarmonicityColor && subscribeManager != null)
+            ? subscribeManager.LatestColorBytes
+            : null;
+
         int totalSpheres = config.nFreq * config.nPartials;
         for (int i = 0; i < totalSpheres; i++)
         {
@@ -1074,6 +1233,28 @@ public class StringFrame3D : MonoBehaviour
             GetSphereID(i, out int stringID, out int partialIndex);
             Vector3 pos = GetSphereWorldPosition(stringID, partialIndex);
             snappedObjects[i].UpdateSnapPosition(pos);
+
+            // UpdateSnappedColor() only fires once, at the moment it's snapped — without this,
+            // a pin's tint would freeze at whatever harmonicity value existed at snap time
+            // instead of tracking subsequent colorBytesAllPartials updates from the backend.
+            Color color = GetHarmonicityTintedColor(i, GetSphereColor(i), colorBytes);
+            color.a = 1f;
+            snappedObjects[i].SetSnapColor(color);
+        }
+    }
+
+    /// <summary>
+    /// Reports a pin's (bot's) status change to the server so it's synced to every other Quest
+    /// device. Pass stringID/partialIndex (>=0) when snapped to a sphere — receivers resolve
+    /// the exact world position locally rather than trusting a transmitted coordinate, since
+    /// every device tracks its own copy of this frame. Pass -1,-1 with localPosition/localRotation
+    /// (relative to THIS transform, not world space) when there's no sphere yet, e.g. Held.
+    /// </summary>
+    public void NotifyPinStateChanged(int botID, UdpSubscriptionClient.PinStatus status, int stringID, int partialIndex, Vector3 localPosition, Quaternion localRotation)
+    {
+        if (subscribeManager != null)
+        {
+            subscribeManager.SendPinState(botID, status, stringID, partialIndex, localPosition, localRotation);
         }
     }
 
@@ -1165,9 +1346,12 @@ public class StringFrame3D : MonoBehaviour
     {
         if (obj == null) return;
 
-        Color color = GetSphereColor(id);
-        color.a = 0.45f;
-        obj.SetTransparent(0.45f);
+        byte[] colorBytes = (useHarmonicityColor && subscribeManager != null)
+            ? subscribeManager.LatestColorBytes
+            : null;
+
+        Color color = GetHarmonicityTintedColor(id, GetSphereColor(id), colorBytes);
+        color.a = 1f;
         obj.SetSnapColor(color);
     }
 

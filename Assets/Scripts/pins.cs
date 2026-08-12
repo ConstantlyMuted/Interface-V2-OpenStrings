@@ -26,8 +26,6 @@ public class SnapGrabbable : MonoBehaviour
     {
         grabbable = GetComponent<Grabbable>();
         rb = GetComponent<Rigidbody>();
-        if (rb != null)
-            rb.useGravity = false; // position owned by snap/grab logic, not physics
 
         renderers = GetComponentsInChildren<Renderer>();
 
@@ -37,6 +35,8 @@ public class SnapGrabbable : MonoBehaviour
 
     private void Update()
     {
+        UpdateRemoteHoldBlock();
+
         if (currentSphere >= 0 && sphereSource != null)
         {
             sphereSource.GetSphereID(
@@ -62,6 +62,29 @@ public class SnapGrabbable : MonoBehaviour
             UpdateHighlights();
     }
 
+    /// <summary>
+    /// Disables the grab interaction while another player already has this exact pin (same
+    /// botIndex) held, per the server's PIN_UPDATE table — prevents two people trying to grab
+    /// the same physical pin at once. Does nothing to a pin THIS device already has grabbed
+    /// (that's its own hold, not a remote one).
+    /// </summary>
+    private void UpdateRemoteHoldBlock()
+    {
+        if (grabbable == null || isHeld || sphereSource == null || botIndex < 0)
+        {
+            if (grabbable != null && !grabbable.enabled)
+                grabbable.enabled = true; // release any block we previously applied
+            return;
+        }
+
+        var client = sphereSource.subscribeManager;
+        bool remoteHeld = client != null &&
+                           client.TryGetPinState(botIndex, out var state) &&
+                           state.status == UdpSubscriptionClient.PinStatus.Held;
+
+        grabbable.enabled = !remoteHeld;
+    }
+
 
     private void OnDestroy()
     {
@@ -84,6 +107,9 @@ public class SnapGrabbable : MonoBehaviour
 
     private void GrabBegin()
     {
+        if (IsRemotelyHeld())
+            return;
+
         ReleaseCurrentSphere();
 
         activeGrab = this;
@@ -91,6 +117,17 @@ public class SnapGrabbable : MonoBehaviour
 
         if (rb)
             rb.isKinematic = false;
+    }
+
+    private bool IsRemotelyHeld()
+    {
+        if (sphereSource == null || botIndex < 0)
+            return false;
+
+        var client = sphereSource.subscribeManager;
+        return client != null &&
+               client.TryGetPinState(botIndex, out var state) &&
+               state.status == UdpSubscriptionClient.PinStatus.Held;
     }
 
 
@@ -200,7 +237,6 @@ public class SnapGrabbable : MonoBehaviour
     }
 
     public void SetSnapColor(Color color) { foreach (Renderer r in renderers) { if (r.material != null) r.material.color = color; } }
-    public void SetTransparent(float alpha) { foreach (Renderer r in renderers) { if (r.material == null) continue; Material mat = r.material; Color c = mat.color; c.a = alpha; mat.color = c; mat.SetFloat("_Mode", 3); mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha); mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha); mat.SetInt("_ZWrite", 0); mat.renderQueue = 3000; } }
 
     private void ReleaseCurrentSphere()
     {

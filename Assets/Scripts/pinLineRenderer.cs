@@ -3,15 +3,13 @@ using UnityEngine;
 
 public class PlayerConnectionLines : MonoBehaviour
 {
-    public enum StateMode { Play, Test }
-
     [SerializeField] private UdpSubscriptionClient client;
+    [SerializeField] private StringFrame3D sphereSource;
     [SerializeField] private Transform[] localHeldTransforms;
     [SerializeField] private Material lineMaterial;
     [SerializeField] private float lineWidth = 0.01f;
 
     [Header("Debug")]
-    [SerializeField] private StateMode stateMode = StateMode.Play;
     [SerializeField] private bool showDebugLogs = true;
 
     private readonly List<LineRenderer> pool = new List<LineRenderer>();
@@ -21,32 +19,20 @@ public class PlayerConnectionLines : MonoBehaviour
     {
         lineIndex = 0;
 
-        if (client == null || localHeldTransforms == null || localHeldTransforms.Length == 0)
+        if (client == null || sphereSource == null || localHeldTransforms == null || localHeldTransforms.Length == 0)
         {
             SetActiveCount(0);
             return;
         }
 
-        var states = stateMode == StateMode.Test
-            ? client.GetStatesWithDummy()
-            : client.LatestStates;
-
-        int localPlayerIndex = client.PlayerIndex;
+        var pinStates = client.LatestPinStates;
 
         if (showDebugLogs)
         {
-            Debug.Log($"[PlayerConnectionLines] Mode={stateMode}, LocalPlayerIndex={localPlayerIndex}, StateCount={states.Length}");
+            Debug.Log($"[PlayerConnectionLines] SetPinCount={pinStates.Count}");
         }
 
-        if (showDebugLogs)
-        {
-            for (int i = 0; i < states.Length; i++)
-            {
-                Debug.Log($"[PlayerConnectionLines] State {i}: playerIndex={states[i].playerIndex}");
-            }
-        }
-
-        // Draw lines from each local grabbable to all held remote objects
+        // Draw lines from each locally-held grabbable to every currently Set/snapped pin.
         for (int g = 0; g < localHeldTransforms.Length; g++)
         {
             Transform grabbable = localHeldTransforms[g];
@@ -70,27 +56,28 @@ public class PlayerConnectionLines : MonoBehaviour
 
             Vector3 origin = grabbable.position;
 
-            for (int i = 0; i < states.Length; i++)
+            foreach (var kvp in pinStates)
             {
-                var s = states[i];
-                if (showDebugLogs)
-                    Debug.Log($"[PlayerConnectionLines]   State {i}: playerIndex={s.playerIndex}, held={s.held}, pos={s.position}");
+                int botId = kvp.Key;
+                UdpSubscriptionClient.PinState state = kvp.Value;
 
-                if (!s.held) continue;
-                if (s.playerIndex == localPlayerIndex)
-                {
-                    if (showDebugLogs)
-                        Debug.Log($"[PlayerConnectionLines]   Skipping self (playerIndex={localPlayerIndex})");
+                if (state.status != UdpSubscriptionClient.PinStatus.Set || !state.HasSphere)
                     continue;
-                }
+
+                if (botId == snap.botIndex)
+                    continue; // don't draw a line to itself
+
+                // Resolve the exact, live sphere position locally rather than trusting a
+                // transmitted coordinate — matches how StringFrame3D positions the pin itself.
+                Vector3 targetPos = sphereSource.GetSphereWorldPosition(state.stringID, state.partialIndex);
 
                 LineRenderer lr = GetOrCreate(lineIndex);
                 lr.SetPosition(0, origin);
-                lr.SetPosition(1, s.position);
+                lr.SetPosition(1, targetPos);
                 lr.gameObject.SetActive(true);
 
                 if (showDebugLogs)
-                    Debug.Log($"[PlayerConnectionLines]   Drew line {lineIndex}: {origin} -> {s.position}");
+                    Debug.Log($"[PlayerConnectionLines]   Drew line {lineIndex}: {origin} -> pin {botId} @ {targetPos}");
 
                 lineIndex++;
             }

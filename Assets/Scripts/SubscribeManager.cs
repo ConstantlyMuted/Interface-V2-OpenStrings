@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -16,6 +17,18 @@ using UnityEngine;
 /// Client -> Server: UPDATE_RECEIVED|playerIndex|sequence
 /// Client -> Server: UNSUBSCRIBE|playerIndex
 /// Client -> Server: SPHERE_TRIGGERED|playerIndex|frequencyIndex|partialIndex|harmonic|frequencyHz|worldX|worldY|worldZ
+/// Client -> Server: PIN_STATE|playerIndex|botID|status|stringID|partialIndex|localX|localY|localZ|localQx|localQy|localQz|localQw
+/// Server -> Client: PIN_UPDATE|count|botID,status,stringID,partialIndex,x,y,z,qx,qy,qz,qw|botID,...   (full pin table, every server tick)
+/// Server -> Client: COLOR_UPDATE|base64Bytes   (colorBytesAllPartials, only sent when it changes)
+///
+/// IMPORTANT: stringID/partialIndex identify which sphere a pin is snapped to (-1,-1 if none).
+/// When valid, receivers should resolve the ACTUAL world position locally via
+/// StringFrame3D.GetSphereWorldPosition(stringID, partialIndex) instead of trusting the
+/// x/y/z fields — every device tracks its own copy of the shared frame (marker tracking),
+/// so a raw world position sent by one device is meaningless on another. The x/y/z/quat
+/// fields are FRAME-LOCAL (relative to StringFrame3D's own transform), used only as a
+/// fallback for the Held state (not snapped to anything yet) — convert with
+/// frame.transform.TransformPoint/rotation, never treat them as world space directly.
 ///
 /// Real server update payload parsing is intentionally disabled until payloads are repaired.
 /// </summary>
@@ -44,11 +57,55 @@ public class UdpSubscriptionClient : MonoBehaviour
         public Vector3 position;
     }
 
+    /// <summary>
+    /// Pin status codes. Must stay in sync with the Java-side PIN_STATUS_* constants
+    /// in TH_UDPBroadcaster. Extend by adding new values on both sides.
+    /// </summary>
+    public enum PinStatus
+    {
+        Unset = 0,
+        Set = 1,
+        Held = 2,
+        Unavailable = 3,   // server-authoritative, never sent by client
+        Playing = 4        // server-authoritative, never sent by client
+    }
+
+    public struct PinState
+    {
+        public int botIndex;
+        public PinStatus status;
+
+        /// <summary>Sphere this pin is snapped to, or -1 if not applicable (e.g. Held/Unset).</summary>
+        public int stringID;
+        public int partialIndex;
+        public bool HasSphere => stringID >= 0 && partialIndex >= 0;
+
+        /// <summary>Frame-local pose fallback — only meaningful when HasSphere is false.</summary>
+        public Vector3 localPosition;
+        public Quaternion localRotation;
+    }
+
     public bool IsSubscribed { get; private set; }
     public int PlayerIndex { get; private set; } = -1;
 
     public PlayerState[] LatestStates { get; private set; } = new PlayerState[0];
     public float LatestStandInFloat { get; private set; } = 0f;
+
+    /// <summary>Latest known state of every pin/bot, keyed by botIndex.</summary>
+    public IReadOnlyDictionary<int, PinState> LatestPinStates => pinStatesByBotId;
+    private readonly Dictionary<int, PinState> pinStatesByBotId = new Dictionary<int, PinState>();
+
+    /// <summary>Latest colorBytesAllPartials payload from the server. Null until first received.</summary>
+    public byte[] LatestColorBytes { get; private set; } = null;
+
+    /// <summary>Fired on the main thread the next Update() after a new PIN_UPDATE is parsed.</summary>
+    public event Action OnPinStatesUpdated;
+
+    /// <summary>Fired on the main thread the next Update() after a new COLOR_UPDATE is parsed.</summary>
+    public event Action OnColorBytesUpdated;
+
+    private volatile bool pinStatesDirty = false;
+    private volatile bool colorBytesDirty = false;
 
     private UdpClient udpClient;
     private IPEndPoint serverEndpoint;
@@ -135,6 +192,19 @@ public class UdpSubscriptionClient : MonoBehaviour
     {
         if (!running)
             return;
+
+        // Events must fire on the main thread; the receiver thread only flags dirty.
+        if (pinStatesDirty)
+        {
+            pinStatesDirty = false;
+            OnPinStatesUpdated?.Invoke();
+        }
+
+        if (colorBytesDirty)
+        {
+            colorBytesDirty = false;
+            OnColorBytesUpdated?.Invoke();
+        }
 
         DateTime now = DateTime.UtcNow;
         bool subscribed;
@@ -291,6 +361,44 @@ public class UdpSubscriptionClient : MonoBehaviour
             return;
         }
 
+        if (text.StartsWith("PIN_UPDATE|", StringComparison.Ordinal))
+        {
+            ParsePinUpdate(text);
+
+            lock (stateLock)
+            {
+                if (!IsSubscribed)
+                    return;
+
+                lastUpdateReceivedUtc = DateTime.UtcNow;
+            }
+
+            // Liveness only; no per-message ACK protocol for pin updates (they arrive every tick).
+            if (showDebugLogs)
+                Debug.Log("[UDP Subscribe] Pin update received. pins=" + pinStatesByBotId.Count);
+
+            return;
+        }
+
+        if (text.StartsWith("COLOR_UPDATE|", StringComparison.Ordinal))
+        {
+            ParseColorUpdate(text);
+
+            lock (stateLock)
+            {
+                if (!IsSubscribed)
+                    return;
+
+                lastUpdateReceivedUtc = DateTime.UtcNow;
+            }
+
+            if (showDebugLogs)
+                Debug.Log("[UDP Subscribe] Color update received. bytes=" +
+                          (LatestColorBytes != null ? LatestColorBytes.Length : 0));
+
+            return;
+        }
+
         // Future compatibility path: a non-control datagram counts as a received update.
         // Parsing remains disabled, but server liveness ACK still functions.
         int subscribedPlayerIndex;
@@ -339,6 +447,84 @@ public class UdpSubscriptionClient : MonoBehaviour
 
         LatestStandInFloat = standIn;
         LatestStates = states;
+    }
+
+    /// <summary>
+    /// Parses "PIN_UPDATE|count|botID,status,x,y,z,qx,qy,qz,qw|botID,...".
+    /// Full table every time — replaces pinStatesByBotId wholesale so pins removed
+    /// server-side (not currently supported, but future-proof) also disappear here.
+    /// </summary>
+    private void ParsePinUpdate(string text)
+    {
+        string[] parts = text.Split('|');
+        if (parts.Length < 2) return;
+
+        if (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int count))
+            return;
+
+        if (parts.Length < 2 + count) return;
+
+        var updated = new Dictionary<int, PinState>(count);
+        for (int i = 0; i < count; i++)
+        {
+            string[] fields = parts[2 + i].Split(',');
+            if (fields.Length < 11) continue;
+
+            try
+            {
+                int botIndex = int.Parse(fields[0], CultureInfo.InvariantCulture);
+                var state = new PinState
+                {
+                    botIndex = botIndex,
+                    status = (PinStatus)int.Parse(fields[1], CultureInfo.InvariantCulture),
+                    stringID = int.Parse(fields[2], CultureInfo.InvariantCulture),
+                    partialIndex = int.Parse(fields[3], CultureInfo.InvariantCulture),
+                    localPosition = new Vector3(
+                        float.Parse(fields[4], CultureInfo.InvariantCulture),
+                        float.Parse(fields[5], CultureInfo.InvariantCulture),
+                        float.Parse(fields[6], CultureInfo.InvariantCulture)),
+                    localRotation = new Quaternion(
+                        float.Parse(fields[7], CultureInfo.InvariantCulture),
+                        float.Parse(fields[8], CultureInfo.InvariantCulture),
+                        float.Parse(fields[9], CultureInfo.InvariantCulture),
+                        float.Parse(fields[10], CultureInfo.InvariantCulture))
+                };
+                updated[botIndex] = state;
+            }
+            catch (FormatException)
+            {
+                // Skip malformed entry, keep parsing the rest.
+            }
+        }
+
+        lock (stateLock)
+        {
+            pinStatesByBotId.Clear();
+            foreach (var kvp in updated)
+                pinStatesByBotId[kvp.Key] = kvp.Value;
+        }
+
+        pinStatesDirty = true;
+    }
+
+    /// <summary>Parses "COLOR_UPDATE|base64Bytes" (colorBytesAllPartials).</summary>
+    private void ParseColorUpdate(string text)
+    {
+        int separatorIndex = text.IndexOf('|');
+        if (separatorIndex < 0 || separatorIndex + 1 >= text.Length) return;
+
+        string base64 = text.Substring(separatorIndex + 1);
+
+        try
+        {
+            LatestColorBytes = Convert.FromBase64String(base64);
+            colorBytesDirty = true;
+        }
+        catch (FormatException e)
+        {
+            if (showDebugLogs)
+                Debug.LogWarning("[UDP Subscribe] Failed to decode COLOR_UPDATE payload: " + e.Message);
+        }
     }
 
     public void SendSphereSelected(
@@ -498,6 +684,55 @@ public class UdpSubscriptionClient : MonoBehaviour
         );
 
         SendText(message);
+    }
+
+    /// <summary>
+    /// Reports a pin's (bot's) status to the server. Only Unset/Set/Held should be sent from
+    /// a client — Unavailable/Playing are server-authoritative and get applied via the
+    /// backend's updatePinStatus() hook, then propagate here through PIN_UPDATE.
+    ///
+    /// Pass stringID/partialIndex (>=0) when the pin is snapped to a sphere — receivers will
+    /// resolve the exact world position locally rather than trusting a transmitted coordinate.
+    /// Pass -1,-1 with localPos/localRot (relative to the StringFrame3D transform, NOT world
+    /// space) when there's no sphere yet, e.g. while just being held.
+    /// </summary>
+    public void SendPinState(int botIndex, PinStatus status, int stringID, int partialIndex, Vector3 localPos, Quaternion localRot)
+    {
+        int playerIndex;
+        bool subscribed;
+        lock (stateLock)
+        {
+            playerIndex = PlayerIndex;
+            subscribed = IsSubscribed;
+        }
+        if (!running || !subscribed || playerIndex < 0)
+            return;
+
+        string message = string.Format(
+            CultureInfo.InvariantCulture,
+            "PIN_STATE|{0}|{1}|{2}|{3}|{4}|{5:F4}|{6:F4}|{7:F4}|{8:F4}|{9:F4}|{10:F4}|{11:F4}",
+            playerIndex,
+            botIndex,
+            (int)status,
+            stringID,
+            partialIndex,
+            localPos.x, localPos.y, localPos.z,
+            localRot.x, localRot.y, localRot.z, localRot.w
+        );
+
+        SendText(message);
+
+        if (showDebugLogs)
+            Debug.Log("[UDP Subscribe] Sent pin state: " + message);
+    }
+
+    /// <summary>Convenience lookup; returns false if the pin/bot hasn't been reported yet.</summary>
+    public bool TryGetPinState(int botIndex, out PinState state)
+    {
+        lock (stateLock)
+        {
+            return pinStatesByBotId.TryGetValue(botIndex, out state);
+        }
     }
 
     /*
